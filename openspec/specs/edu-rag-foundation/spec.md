@@ -1,3 +1,7 @@
+## Purpose
+
+Define the baseline FastAPI project structure, shared schemas, configuration, health check, adapter boundaries, and offline test expectations for the education RAG backend.
+
 ## Requirements
 
 ### Requirement: Project skeleton
@@ -72,7 +76,7 @@ The system SHALL define Pydantic schemas for `KnowledgeChunk`, `Question`, `Impo
 
 ### Requirement: External service adapters
 
-The system SHALL provide utility modules that define adapter boundaries for LLM, Embedding, Reranker, MongoDB, Milvus, and MinIO integrations without requiring live external services during application startup.
+The system SHALL provide utility modules that define adapter boundaries for LLM, Embedding, Reranker, MongoDB, Milvus, and MinIO integrations without requiring live external services during application startup, and those adapter boundaries SHALL expose the operations needed by the content import pipeline.
 
 #### Scenario: Adapter modules can be imported offline
 
@@ -83,6 +87,16 @@ The system SHALL provide utility modules that define adapter boundaries for LLM,
 
 - **WHEN** code calls an external operation that is only a placeholder in this foundation phase
 - **THEN** the system raises a clear not-implemented or configuration error instead of failing silently
+
+#### Scenario: Import pipeline can depend on adapter contracts
+
+- **WHEN** import service code needs to store task metadata, persist original files, generate embeddings, or write vector records
+- **THEN** it can call explicit MongoDB, MinIO, Embedding, and Milvus adapter methods without importing concrete vendor clients in the service layer
+
+#### Scenario: Import adapters support offline replacements
+
+- **WHEN** import pipeline tests run without configured external services
+- **THEN** the same adapter contracts can be satisfied by in-memory replacements without changing API or service code
 
 ### Requirement: Foundation tests
 

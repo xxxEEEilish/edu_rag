@@ -29,3 +29,9 @@ class Question(BaseModel):
     chapter_name: str | None = None
     knowledge_points: list[str] = Field(default_factory=list)
     tenant_id: str = "default"
+    # 导入追踪字段用于把题目检索结果关联回原始题库文件和导入任务，后续后台复核、
+    # 增量更新和答案引用都依赖这些字段定位来源。
+    source_file_name: str | None = None
+    source_path: str | None = None
+    import_task_id: str | None = None
+    content_hash: str | None = None
