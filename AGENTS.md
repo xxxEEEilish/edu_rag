@@ -4,6 +4,12 @@
 
 Always answer the user in Chinese.
 
+## Code Style
+
+When writing or modifying code, add detailed Chinese comments for modules, classes,
+functions, important fields, and non-obvious logic. Comments should explain intent,
+data flow, constraints, and extension points, not merely restate the code.
+
 Use OpenSpec for planned development in this repository.
 
 ## OpenSpec Commands
