@@ -12,6 +12,18 @@ data flow, constraints, and extension points, not merely restate the code.
 
 Use OpenSpec for planned development in this repository.
 
+## Encoding rules
+
+- This project uses UTF-8 for all source files.
+- When reading files on Windows PowerShell, do not use plain `Get-Content` for files that may contain Chinese.
+- Always use:
+  `Get-Content -Encoding UTF8 <path>`
+- For Python files with Chinese comments or docstrings, prefer:
+  `python -c "from pathlib import Path; print(Path(r'<path>').read_text(encoding='utf-8'))"`
+- If terminal output is garbled, set UTF-8 first:
+  `$OutputEncoding = [Console]::InputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new()`
+- Do not rewrite files only because terminal output looks garbled. First verify whether it is only a display/encoding issue.
+
 ## OpenSpec Commands
 
 The npm package exposes the `openspec` CLI. The `/opsx:*` commands in generated prompt files are chat shortcuts, not PowerShell commands.

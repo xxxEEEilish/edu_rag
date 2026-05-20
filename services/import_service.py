@@ -33,7 +33,17 @@ class ImportTaskNotFoundError(KeyError):
 
 
 class ImportService:
-    """内容导入流水线服务。"""
+    """内容导入流水线服务。
+
+    该服务是导入能力的唯一编排入口：API 层只负责把 HTTP 请求转换成
+    `ImportRequest`，具体的任务创建、状态推进、原始文件保存、解析、切片、
+    向量化和元数据落库都在这里完成。这样做的好处是后续即使把同步执行替换为
+    Celery、RQ 或独立 worker，核心业务状态机仍然可以复用。
+
+    服务只依赖 `utils.import_adapters` 中定义的协议，不依赖具体基础设施客户端。
+    这条边界非常重要：测试可以注入内存适配器，生产环境可以注入 MongoDB、MinIO、
+    Milvus 和真实 Embedding 客户端，而导入流程本身不需要知道底层实现。
+    """
 
     def __init__(
         self,
@@ -47,12 +57,22 @@ class ImportService:
         parser_registry: ParserRegistry | None = None,
         chunker: DocumentChunker | None = None,
     ) -> None:
+        # 任务仓储负责保存任务状态机的每一次变化。导入链路出现失败时，用户能否看到
+        # “失败在哪个阶段”完全依赖这里的状态被及时更新。
         self.task_repository = task_repository
+        # 原始文件存储位于解析之前，目的是保证即使后续解析或向量化失败，也能保留
+        # 可复核的原始输入，便于重试、人工排查或后续增量导入。
         self.source_store = source_store
+        # 文档片段仓储保存可检索文本的业务元数据，不保存真实向量；向量写入由
+        # vector_index 处理，二者分离可以避免 MongoDB/Milvus 互相泄漏实现细节。
         self.chunk_repository = chunk_repository
+        # 题库数据和文档片段结构差异较大，因此题目单独进入 question_repository，
+        # 但仍共享同一任务状态和来源追踪策略。
         self.question_repository = question_repository
         self.embedding_model = embedding_model
         self.vector_index = vector_index
+        # parser_registry 和 chunker 支持注入，测试可以替换为特殊失败实现，后续也可以
+        # 按租户、文件类型或配置切换更复杂的解析/切片策略。
         self.parser_registry = parser_registry or default_parser_registry()
         self.chunker = chunker or DocumentChunker()
 
@@ -77,10 +97,17 @@ class ImportService:
         return self.run_task(task.task_id, request)
 
     def run_task(self, task_id: str, request: ImportRequest) -> ImportResult:
-        """执行导入流水线并返回结果。"""
+        """执行导入流水线并返回结果。
+
+        状态推进顺序必须保持稳定：重复导入检测 -> 保存原始文件 -> 解析 -> 文档切片或
+        题库转换 -> 向量化 -> 向量索引 -> 元数据保存 -> 完成。每个阶段都会更新任务，
+        因此即使中途失败，调用方也能通过任务详情看到最后一个阶段和错误原因。
+        """
         task = self._require_task(task_id)
         source_bytes = request.source_bytes()
         try:
+            # 幂等判断放在原始文件保存之前，避免同一租户重复提交同一来源时浪费存储、
+            # 解析和向量化资源。force_reimport 会绕过该逻辑，用于显式重建版本。
             duplicate = self._find_duplicate(task, request)
             if duplicate:
                 return self._complete_duplicate(task, duplicate)
@@ -95,6 +122,8 @@ class ImportService:
             self._save_task(task)
 
             self._set_processing(task, ImportStage.PARSED, 30, "正在解析内容")
+            # 解析器只返回统一中间结构，不直接产生 KnowledgeChunk 或 Question。
+            # 这样文档解析、题库解析和未来 PDF/OCR 解析可以独立演进。
             parser = self.parser_registry.get(request.resolved_format())
             parsed = parser.parse(
                 file_name=request.file_name,
@@ -104,9 +133,13 @@ class ImportService:
             )
             task.warning_count = len(parsed.warnings)
             task.warnings = parsed.warnings
+            # 解析告警是非致命信息，例如 DOCX 图片或公式暂时无法提取。它们需要保存给
+            # 管理端展示，但不能阻塞可解析文本继续进入知识库。
             self.chunk_repository.save_parser_warnings(task.task_id, parsed.warnings)
             self._save_task(task)
 
+            # 题库和文档共享同一导入任务生命周期，但落库目标不同：题库保存为结构化
+            # Question，文档先切片再进入 Embedding 和向量索引。
             if isinstance(parsed, ParsedQuestionSet):
                 return self._persist_questions(task, parsed)
             return self._persist_document(task, parsed)
@@ -121,7 +154,11 @@ class ImportService:
         return ImportTaskDetail(**task.model_dump())
 
     def _persist_document(self, task: ImportTask, parsed: ParsedDocument) -> ImportResult:
-        """保存文档类导入结果。"""
+        """保存文档类导入结果。
+
+        文档类数据需要先生成可检索片段，再为每个片段生成向量。这里故意先完成全部
+        Embedding，再批量写向量索引，避免只写入一部分向量却把任务标记为成功。
+        """
         self._set_processing(task, ImportStage.CHUNKED, 50, "正在生成知识片段")
         chunks = self.chunker.chunk_document(parsed, task_id=task.task_id, version=task.version)
         task.chunk_count = len(chunks)
@@ -130,6 +167,8 @@ class ImportService:
 
         self._set_processing(task, ImportStage.EMBEDDED, 70, "正在生成文本向量")
         vectors = self.embedding_model.embed_texts([chunk.content for chunk in chunks])
+        # Embedding 结果必须与输入片段一一对应；数量不一致通常代表模型服务、适配器或
+        # 批处理逻辑异常，继续写入会导致 chunk_id 与向量错位，因此必须失败。
         if len(vectors) != len(chunks):
             raise ValueError("Embedding 返回数量与知识片段数量不一致")
         self._save_task(task)
@@ -152,10 +191,16 @@ class ImportService:
         )
 
     def _persist_questions(self, task: ImportTask, parsed: ParsedQuestionSet) -> ImportResult:
-        """保存结构化题库导入结果。"""
+        """保存结构化题库导入结果。
+
+        题库数据不进入文档切片器，因为题干、选项、答案和解析需要保持结构化字段，
+        方便后续按题型、难度、知识点过滤，也能在问答中精确引用标准答案。
+        """
         self._set_processing(task, ImportStage.PERSISTED, 80, "正在保存题库记录")
         questions = [
             Question(
+                # 如果上游没有提供题目 ID，则使用题干和任务 ID 生成稳定但任务内唯一的 ID。
+                # 真实生产环境后续可以替换为题库系统 ID 或数据库生成 ID。
                 question_id=item.question_id or f"question_{stable_sha256(item.stem + task.task_id)[:24]}",
                 question_code=item.question_code,
                 question_bank_name=item.question_bank_name,
@@ -203,7 +248,11 @@ class ImportService:
         )
 
     def _complete_duplicate(self, task: ImportTask, duplicate: ImportTask) -> ImportResult:
-        """把重复导入任务标记为已跳过但成功完成。"""
+        """把重复导入任务标记为已跳过但成功完成。
+
+        重复导入不是错误：用户提交了已经完成的同源内容，系统应返回一个可查询的任务，
+        并指向已有导入结果。这样前端不需要特殊处理“重复”异常，也不会生成重复索引。
+        """
         task.status = ImportTaskStatus.COMPLETED
         task.stage = ImportStage.SKIPPED_DUPLICATE
         task.progress = 100
@@ -231,7 +280,12 @@ class ImportService:
         task.error = None
 
     def _fail_task(self, task: ImportTask, exc: Exception) -> ImportResult:
-        """将任务标记为失败并保存错误原因。"""
+        """将任务标记为失败并保存错误原因。
+
+        失败处理必须集中在这里，确保所有异常路径都能留下相同结构的状态记录。当前
+        `error` 保存用户可读文本；后续如果需要内部错误码、堆栈或重试策略，可以在
+        ImportTask 中扩展字段，而不改变 API 的基本状态语义。
+        """
         task.status = ImportTaskStatus.FAILED
         task.stage = ImportStage.FAILED
         task.message = "导入失败"

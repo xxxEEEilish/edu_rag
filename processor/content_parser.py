@@ -57,9 +57,20 @@ class ParserRegistry:
         self._parsers: dict[ImportInputFormat, ContentParser] = {}
 
     def register(self, input_format: ImportInputFormat, parser: ContentParser) -> None:
+        """注册指定格式的解析器。
+
+        注册表允许后续按配置替换解析器，例如把当前标准库 DOCX 解析器替换为
+        python-docx、LibreOffice 转换服务或 OCR 管线。调用方不应绕过注册表直接
+        判断扩展名，否则会让格式扩展散落到多个模块。
+        """
         self._parsers[input_format] = parser
 
     def get(self, input_format: ImportInputFormat) -> ContentParser:
+        """获取格式对应的解析器。
+
+        如果格式未注册，抛出业务可识别的错误，让导入服务把任务标记为 failed，而不是
+        返回空解析结果。空结果会让用户误以为文件成功导入但没有内容。
+        """
         parser = self._parsers.get(input_format)
         if parser is None:
             raise UnsupportedImportFormatError(f"不支持的导入格式: {input_format}")
@@ -89,11 +100,20 @@ class TextDocumentParser(ContentParser):
         text = content.decode("utf-8")
         warnings: list[ParserWarning] = []
         sections: list[ParsedSection] = []
+        # heading_stack 保存当前段落所在的标题路径。Markdown 标题层级会动态覆盖栈中
+        # 对应层级，保证 “一级标题 / 二级标题 / 正文段落” 的关系能够进入片段元数据。
         heading_stack: list[str] = []
+        # buffer 暂存连续正文行，遇到空行或新标题时 flush 成一个 ParsedSection。
+        # 这样可以保留自然段边界，避免每一行都变成过短片段。
         buffer: list[str] = []
         order = 0
 
         def flush(location: str) -> None:
+            """把当前缓冲区转换成解析段落。
+
+            location 记录触发 flush 的位置，后续如果用户质疑某个片段来源，可以结合
+            source_path、heading_path 和 location 回到原始文档附近进行复核。
+            """
             nonlocal order
             joined = "\n".join(line.strip() for line in buffer if line.strip()).strip()
             buffer.clear()
@@ -115,6 +135,8 @@ class TextDocumentParser(ContentParser):
         for line_number, line in enumerate(text.splitlines(), start=1):
             heading_match = self.heading_pattern.match(line.strip()) if self.markdown else None
             if heading_match:
+                # 标题本身不作为正文段落入库，而是作为后续正文的层级上下文。这样召回
+                # 结果既能包含正文内容，也能知道正文属于哪个章节。
                 flush(f"line:{line_number}")
                 level = len(heading_match.group(1))
                 title = heading_match.group(2).strip()
@@ -162,6 +184,8 @@ class DocxDocumentParser(ContentParser):
 
         try:
             with zipfile.ZipFile(BytesIO(content)) as archive:
+                # DOCX 本质是 zip 包，正文 XML 位于 word/document.xml。当前实现只读取
+                # 正文 XML，后续若要提取图片或样式，可继续读取 word/media 和样式表。
                 xml_bytes = archive.read("word/document.xml")
         except Exception as exc:
             raise ValueError(f"DOCX 文件无法读取: {exc}") from exc
@@ -183,6 +207,8 @@ class DocxDocumentParser(ContentParser):
                     continue
                 style = self._paragraph_style(element)
                 if style and style.lower().startswith("heading"):
+                    # Word 标题样式用于构造 heading_path，不直接写入正文段落。复杂模板中
+                    # 标题样式名称可能不规范，后续可在这里扩展样式映射规则。
                     level = self._heading_level(style)
                     heading_stack = heading_stack[: level - 1] + [text]
                     continue
@@ -199,6 +225,8 @@ class DocxDocumentParser(ContentParser):
                     )
                 )
             elif tag == "tbl":
+                # 表格经常承载课程大纲、步骤、题目选项等关键信息。首期把每行拼成
+                # “单元格 | 单元格” 的可检索文本，保留顺序优先于保留复杂排版。
                 table_text = self._table_text(element)
                 if table_text:
                     order += 1
@@ -215,6 +243,8 @@ class DocxDocumentParser(ContentParser):
                     )
 
         if root.findall(".//w:drawing", self.namespace):
+            # 图片、绘图对象目前不进入文本索引，但必须记录告警。后续多模态导入可以用
+            # 这些 warning 作为发现未处理资源的入口。
             warnings.append(
                 ParserWarning(
                     code="unsupported_docx_drawing",
@@ -286,6 +316,8 @@ class QuestionJsonParser(ContentParser):
         metadata: ImportMetadata,
     ) -> ParsedQuestionSet:
         raw = json.loads(content.decode("utf-8"))
+        # 兼容两种常见题库 JSON：直接传数组，或传 {"questions": [...]}。这能降低
+        # 初期数据接入成本，同时仍保持每道题的字段校验。
         records = raw.get("questions", raw) if isinstance(raw, dict) else raw
         if not isinstance(records, list):
             raise ValueError("题库 JSON 必须是数组，或包含 questions 数组字段")
@@ -294,6 +326,8 @@ class QuestionJsonParser(ContentParser):
         warnings: list[ParserWarning] = []
         for index, record in enumerate(records, start=1):
             if not isinstance(record, dict):
+                # 非对象记录无法映射为 QuestionImportItem，但不立即中断整个文件，避免
+                # 单条脏数据掩盖后续更多有效题目和校验信息。
                 warnings.append(
                     ParserWarning(
                         code="invalid_question_record",
@@ -334,6 +368,8 @@ class QuestionJsonParser(ContentParser):
     ) -> dict[str, Any]:
         """补齐题目来源字段并生成内容哈希。"""
         content_seed = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        # 题目内容哈希基于规范化 JSON，而不是原始文件字节。这样同一题即使字段顺序
+        # 不同，也能得到相同 hash，便于后续题库增量更新和重复检测。
         return {
             **record,
             "source_file_name": record.get("source_file_name") or file_name,
